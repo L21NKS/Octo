@@ -3,94 +3,131 @@ import numpy as np
 import os
 from logger import logger
 
-def initialize_cameras(camera_indices):
-    """Инициализация камер"""
+# === ГЛОБАЛЬНЫЕ ПАРАМЕТРЫ ОПТИМИЗАЦИИ ДЛЯ RASPBERRY PI 5 ===
+TARGET_RESOLUTION = (480, 320)  # Ширина x Высота
+TARGET_FPS = 8                  # Достаточно для видеонаблюдения
+FACE_DETECTION_SCALE = 1.5      # Уменьшение кадра перед детекцией лиц (ускорение)
+JPEG_QUALITY = 70               # Качество JPEG для потоковой передачи
+
+def initialize_cameras(camera_indices, target_resolution=TARGET_RESOLUTION, target_fps=TARGET_FPS):
+    """Инициализация камер с пониженным разрешением и FPS для Raspberry Pi"""
     caps = []
     for idx in camera_indices:
-        cap = cv2.VideoCapture(idx)
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)  # Явное указание бэкенда (лучше на Linux)
         if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            logger.success(f"Camera initialized {idx}")
+            # Устанавливаем параметры
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_resolution[0])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_resolution[1])
+            cap.set(cv2.CAP_PROP_FPS, target_fps)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Минимальный буфер — снижает задержку и потребление памяти
+
+            # Проверка фактических значений
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            logger.success(f"Camera {idx} initialized: {w}x{h} @ {fps:.1f} FPS")
         else:
-            logger.error(f"Failed to initialize the camera {idx}")
+            logger.error(f"Failed to initialize camera {idx}")
         caps.append(cap)
     return caps
+
 
 def release_cameras(caps):
     """Освобождение ресурсов камер"""
     for cap in caps:
-        if cap.isOpened():
+        if cap and cap.isOpened():
             cap.release()
     logger.info("Camera resources have been released")
 
+
 def create_video_grid(frames, grid_size=(2, 2), output_size=(640, 480)):
-    """Создание сетки из кадров"""
+    """Создание сетки из кадров (все кадры уже в TARGET_RESOLUTION)"""
     if not frames:
         return np.zeros((output_size[1], output_size[0], 3), dtype=np.uint8)
     
-    resized_frames = [cv2.resize(frame, (output_size[0] // grid_size[1], 
-                                       output_size[1] // grid_size[0])) 
-                     for frame in frames]
+    # Рассчитываем размер ячейки
+    cell_w = output_size[0] // grid_size[1]
+    cell_h = output_size[1] // grid_size[0]
     
+    resized_frames = []
+    for frame in frames:
+        # Пропорциональное изменение размера с обрезкой или отступами, чтобы избежать искажений
+        h, w = frame.shape[:2]
+        scale = min(cell_w / w, cell_h / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = cv2.resize(frame, (new_w, new_h))
+        
+        # Центрируем в ячейке
+        canvas = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+        y_offset = (cell_h - new_h) // 2
+        x_offset = (cell_w - new_w) // 2
+        canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+        resized_frames.append(canvas)
+
+    # Добавляем пустые кадры, если камер меньше, чем ячеек
+    while len(resized_frames) < grid_size[0] * grid_size[1]:
+        resized_frames.append(np.zeros((cell_h, cell_w, 3), dtype=np.uint8))
+
+    # Формируем сетку
     rows = []
     for i in range(0, len(resized_frames), grid_size[1]):
-        row_frames = resized_frames[i:i + grid_size[1]]
-        if len(row_frames) < grid_size[1]:
-            empty_frames = [np.zeros_like(row_frames[0]) for _ in range(grid_size[1] - len(row_frames))]
-            row_frames.extend(empty_frames)
-        row = np.hstack(row_frames)
+        row = np.hstack(resized_frames[i:i + grid_size[1]])
         rows.append(row)
     
     grid = np.vstack(rows[:grid_size[0]])
     return grid
 
-def get_no_signal_frame(camera_idx, size=(640, 480)):
-    """Создание кадра 'Нет сигнала'"""
-    frame = np.zeros((size[1], size[0], 3), dtype=np.uint8)
-    cv2.putText(frame, f"No signal {camera_idx}", 
-               (240, size[1] // 2), cv2.FONT_HERSHEY_SIMPLEX, 
-               1, (0, 0, 255), 2)
+
+def get_no_signal_frame(camera_idx, size=TARGET_RESOLUTION):
+    """Кадр 'Нет сигнала' в оптимальном разрешении"""
+    h, w = size[1], size[0]
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    text = f"No signal cam {camera_idx}"
+    font_scale = max(0.5, min(1.0, w / 640))
+    thickness = 1
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+    cv2.putText(frame, text, ((w - tw) // 2, h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), thickness)
     return frame
 
-def get_waiting_frame(camera_idx, time_left=None, size=(640, 480)):
-    """Создание кадра 'Ожидание движения'"""
-    frame = np.zeros((size[1], size[0], 3), dtype=np.uint8)
-    cv2.putText(frame, f"CAMERA {camera_idx}", 
-               (240, size[1] // 2 - 60), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.putText(frame, "WAITING FOR MOTION", 
-               (size[0] // 2 - 120, size[1] // 2), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+def get_waiting_frame(camera_idx, time_left=None, size=TARGET_RESOLUTION):
+    """Кадр 'Ожидание движения'"""
+    h, w = size[1], size[0]
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    cv2.putText(frame, f"CAM {camera_idx}", (w // 2 - 50, h // 2 - 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(frame, "WAITING FOR MOTION", (w // 2 - 90, h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     if time_left is not None:
-        cv2.putText(frame, f"Next check: {time_left}s", 
-                   (240, size[1] // 2 + 40), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-    cv2.putText(frame, "Standby mode", 
-               (240, size[1] - 20), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        cv2.putText(frame, f"Next: {time_left}s", (w // 2 - 50, h // 2 + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
     return frame
+
 
 class MultiMaskCreator:
     def create_mask(self, camera_index, mask_name="default"):
+        # Проверка: запущено ли в GUI-сессии (иначе cv2.imshow не работает)
+        if os.environ.get('SSH_CLIENT') or os.environ.get('SSH_TTY'):
+            logger.error("Mask creation requires GUI (X11/VNC). Not available over SSH.")
+            return None
+
         cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
             logger.error(f"Couldn't open camera {camera_index}")
+            return None
 
-        print(f"Creating masks for the camera {camera_index}")
+        print(f"Creating mask for camera {camera_index}")
         print("Instructions:")
-        print("1. 's' - start/finish drawing the polygon")
-        print("2. LMB - add polygon point")
-        print("3. PCM - delete the last point")
-        print("4. 'c' - clear the current polygon")
-        print("5. 'n' - add the current polygon to the mask and start a new one")
-        print("6. 'q' - save all masks and exit")
-        print("7. ESC - exit without saving")
+        print("  's' - toggle drawing")
+        print("  LMB - add point | RMB - remove last point")
+        print("  'c' - clear polygon | 'n' - save polygon")
+        print("  'q' - save mask | ESC - quit without saving")
 
         os.makedirs("masks", exist_ok=True)
         mask_path = f"masks/camera_{camera_index}_{mask_name}.png"
 
-        polygons = []  # Список всех полигонов
+        polygons = []
         current_polygon = []
         drawing = False
 
@@ -98,95 +135,99 @@ class MultiMaskCreator:
             nonlocal current_polygon, drawing
             if event == cv2.EVENT_LBUTTONDOWN and drawing:
                 current_polygon.append((x, y))
-            elif event == cv2.EVENT_RBUTTONDOWN and drawing and current_polygon:
+            elif event == cv2.EVENT_RBUTTONDOWN and current_polygon:
                 current_polygon.pop()
 
-        cv2.namedWindow("Create MultiMask")
+        cv2.namedWindow("Create MultiMask", cv2.WINDOW_NORMAL)
         cv2.setMouseCallback("Create MultiMask", mouse_callback)
 
         while True:
             ret, frame = cap.read()
             if not ret:
-                logger.critical("Couldn't get a frame")
+                logger.critical("Failed to read frame")
                 break
 
-            display_frame = frame.copy()
-
-            # Рисуем уже сохраненные полигоны
+            display = frame.copy()
             for poly in polygons:
-                cv2.polylines(display_frame, [np.array(poly)], isClosed=True, color=(0,255,0), thickness=2)
-                for pt in poly:
-                    cv2.circle(display_frame, pt, 5, (0,0,255), -1)
-
-            # Рисуем текущий полигон
+                pts = np.array(poly, np.int32)
+                cv2.polylines(display, [pts], True, (0, 255, 0), 2)
             if len(current_polygon) > 1:
-                for i in range(len(current_polygon)-1):
-                    cv2.line(display_frame, current_polygon[i], current_polygon[i+1], (0,255,255), 2)
+                pts = np.array(current_polygon, np.int32)
+                cv2.polylines(display, [pts], False, (0, 255, 255), 2)
             for pt in current_polygon:
-                cv2.circle(display_frame, pt, 5, (255,0,0), -1)
+                cv2.circle(display, pt, 3, (255, 0, 0), -1)
 
-            cv2.imshow("Create MultiMask", display_frame)
+            cv2.imshow("Create MultiMask", display)
             key = cv2.waitKey(30) & 0xFF
 
             if key == ord('s'):
                 drawing = not drawing
-                print(f"Drawing {'started' if drawing else 'finished'}")
             elif key == ord('c'):
                 current_polygon = []
-                print("Clearing the current polygon")
             elif key == ord('n'):
                 if len(current_polygon) >= 3:
                     polygons.append(current_polygon.copy())
                     current_polygon = []
-                    logger.success(f"Polygon added. Total polygons: {len(polygons)}")
+                    logger.success(f"Polygon added ({len(polygons)} total)")
                 else:
-                    logger.error("You need >= 3 points for a polygon")
+                    logger.warning("Need >=3 points")
             elif key == ord('q'):
                 if polygons:
                     mask = np.zeros(frame.shape[:2], dtype=np.uint8)
                     for poly in polygons:
                         pts = np.array(poly, np.int32)
-                        cv2.fillPoly(mask, [pts], 255)  # Все полигоны в одной маске
+                        cv2.fillPoly(mask, [pts], 255)
                     cv2.imwrite(mask_path, mask)
-                    logger.success(f"Mask save: {mask_path}")
-                    cap.release()
-                    cv2.destroyAllWindows()
-                    return mask_path
+                    logger.success(f"Mask saved: {mask_path}")
+                    break
                 else:
-                    logger.error("There is no polygon to save")
-            elif key == 27:
-                logger.warning("Exit without save")
-                cap.release()
-                cv2.destroyAllWindows()
-                return None
+                    logger.error("No polygons to save")
+            elif key == 27:  # ESC
+                logger.warning("Exit without saving")
+                mask_path = None
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
+        return mask_path
 
 
 def load_mask(mask_path):
-    """Загружает маску из файла"""
+    """Загрузка маски"""
     if os.path.exists(mask_path):
-        return cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is not None:
+            # Приводим маску к бинарному виду (0 / 255)
+            _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        return mask
     return None
 
-def overlay_mask(frame, mask, color=(0,255,0), alpha=0.3):
-    """Накладывает прозрачную маску на кадр"""
-    if mask is None:
+
+def overlay_mask(frame, mask, color=(0, 255, 0), alpha=0.3):
+    """Наложение маски (только если она есть)"""
+    if mask is None or mask.size == 0:
         return frame
-    overlay = frame.copy()
-    mask_3ch = cv2.merge([mask, mask, mask])
-    color_layer = np.zeros_like(frame)
-    color_layer[:] = color
-    overlay = np.where(mask_3ch != 0, cv2.addWeighted(color_layer, alpha, overlay, 1 - alpha, 0), overlay)
-    return overlay
+    # Создаём цветной слой маски
+    color_layer = np.full(frame.shape, color, dtype=np.uint8)
+    # Применяем прозрачность только там, где маска активна
+    mask_bool = mask.astype(bool)
+    frame[mask_bool] = cv2.addWeighted(frame[mask_bool], 1 - alpha, color_layer[mask_bool], alpha, 0)
+    return frame
+
 
 def draw_bounding_box(frame, rect, label=None, color=(0, 255, 0)):
-    """Унифицированное рисование bounding box"""
+    """Рисование bounding box (упрощено)"""
     x, y, w, h = rect
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
     if label:
-        cv2.putText(frame, label, (x + 5, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.putText(frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
 
 def load_lbph_face_recognizer(model_path="face_model.yml", labels_path="labels.npy"):
-    """Загрузка обученной модели распознавания лиц"""
+    """Загрузка модели распознавания лиц"""
+    if not (os.path.exists(model_path) and os.path.exists(labels_path)):
+        logger.warning("Face model files not found")
+        return None, None, None
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     recognizer.read(model_path)
     label_dict = np.load(labels_path, allow_pickle=True).item()
@@ -194,69 +235,66 @@ def load_lbph_face_recognizer(model_path="face_model.yml", labels_path="labels.n
     return recognizer, label_dict, face_cascade
 
 
-def detect_faces_only(frame):
-    """
-    Детекция лиц БЕЗ распознавания (когда модель не обучена).
-    Все лица отмечаются как "НЕ РАСПОЗНАН" красным цветом.
-    """
+def detect_faces_only(frame, detection_scale=FACE_DETECTION_SCALE):
+    """Детекция лиц БЕЗ распознавания (оптимизировано)"""
+    h, w = frame.shape[:2]
+    small_w, small_h = int(w / detection_scale), int(h / detection_scale)
+    small_frame = cv2.resize(frame, (small_w, small_h))
+    gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(20, 20)
+    )
+
     face_boxes = []
-    
-    color = (0, 0, 255)  # Красный (BGR)
-    
-    for (x, y, w, h) in faces:
-        face_boxes.append([x, y, x+w, y+h])
-        
-        # Рисуем красный квадрат
-        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-        
-        # Текст "НЕ РАСПОЗНАН"
-        label_text = "NE RASPOZNAN"
-        text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-        cv2.rectangle(frame, (x, y - text_size[1] - 10), (x + text_size[0] + 5, y), color, -1)
-        cv2.putText(frame, label_text, (x + 2, y - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    
+    for (x, y, fw, fh) in faces:
+        # Масштабируем обратно
+        x, y = int(x * detection_scale), int(y * detection_scale)
+        fw, fh = int(fw * detection_scale), int(fh * detection_scale)
+        face_boxes.append([x, y, x + fw, y + fh])
+        cv2.rectangle(frame, (x, y), (x + fw, y + fh), (0, 0, 255), 1)
+        cv2.putText(frame, "NE RASPOZNAN", (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
     return frame, face_boxes
 
-def detect_and_recognize_faces(recognizer, label_dict, face_cascade, frame, confidence_threshold=80):
-    """
-    Распознавание лиц на кадре.
-    - Распознанное лицо: ЗЕЛЁНЫЙ квадрат + имя
-    - Нераспознанное лицо: КРАСНЫЙ квадрат + "НЕ РАСПОЗНАН"
-    """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-    face_boxes = []
 
-    for (x, y, w, h) in faces:
-        roi = gray[y:y+h, x:x+w]
+def detect_and_recognize_faces(recognizer, label_dict, face_cascade, frame, confidence_threshold=80, detection_scale=FACE_DETECTION_SCALE):
+    """Распознавание лиц с оптимизацией под Pi"""
+    h, w = frame.shape[:2]
+    small_w, small_h = int(w / detection_scale), int(h / detection_scale)
+    small_frame = cv2.resize(frame, (small_w, small_h))
+    gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(20, 20)
+    )
+
+    face_boxes = []
+    for (x, y, fw, fh) in faces:
+        x, y = int(x * detection_scale), int(y * detection_scale)
+        fw, fh = int(fw * detection_scale), int(fh * detection_scale)
+        roi = cv2.cvtColor(frame[y:y+fh, x:x+fw], cv2.COLOR_BGR2GRAY)
+
         label_id, confidence = recognizer.predict(roi)
-        
+
         if confidence < confidence_threshold:
-            # Распознан - ЗЕЛЁНЫЙ
-            name = label_dict.get(label_id, "Неизвестный ID")
-            color = (0, 255, 0)  # Зелёный (BGR)
+            name = label_dict.get(label_id, "Unknown")
+            color = (0, 255, 0)
             label_text = f"{name} ({int(confidence)})"
         else:
-            # НЕ распознан - КРАСНЫЙ
-            color = (0, 0, 255)  # Красный (BGR)
+            color = (0, 0, 255)
             label_text = f"NE RASPOZNAN ({int(confidence)})"
 
-        face_boxes.append([x, y, x+w, y+h])
-        
-        # Рисуем квадрат
-        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-        
-        # Фон для текста (для лучшей читаемости)
-        text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-        cv2.rectangle(frame, (x, y - text_size[1] - 10), (x + text_size[0] + 5, y), color, -1)
-        
-        # Текст (белый на цветном фоне)
-        cv2.putText(frame, label_text, (x + 2, y - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    
-    return frame, face_boxes
+        face_boxes.append([x, y, x + fw, y + fh])
+        cv2.rectangle(frame, (x, y), (x + fw, y + fh), color, 1)
+        cv2.putText(frame, label_text, (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
+    return frame, face_boxes
