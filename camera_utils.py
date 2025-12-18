@@ -1,31 +1,36 @@
 import cv2
 import numpy as np
 import os
+import time
 from logger import logger
 
 # === ГЛОБАЛЬНЫЕ ПАРАМЕТРЫ ОПТИМИЗАЦИИ ДЛЯ RASPBERRY PI 5 ===
-TARGET_RESOLUTION = (480, 320)  # Ширина x Высота
-TARGET_FPS = 8                  # Достаточно для видеонаблюдения
+TARGET_RESOLUTION = (320, 240)  # Было (480, 320) → снижено для 4 камер
+TARGET_FPS = 8                  # Оставлено 8 FPS — достаточно и безопасно
 FACE_DETECTION_SCALE = 1.5      # Уменьшение кадра перед детекцией лиц (ускорение)
 JPEG_QUALITY = 70               # Качество JPEG для потоковой передачи
 
 def initialize_cameras(camera_indices, target_resolution=TARGET_RESOLUTION, target_fps=TARGET_FPS):
-    """Инициализация камер с пониженным разрешением и FPS для Raspberry Pi"""
+    """Инициализация камер с пониженным разрешением, MJPG и паузой для Raspberry Pi"""
     caps = []
     for idx in camera_indices:
-        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)  # Явное указание бэкенда (лучше на Linux)
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)  # Явное указание V4L2 бэкенда
         if cap.isOpened():
-            # Устанавливаем параметры
+            # 🔑 КЛЮЧЕВЫЕ ОПТИМИЗАЦИИ:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))  # MJPG
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_resolution[0])
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_resolution[1])
             cap.set(cv2.CAP_PROP_FPS, target_fps)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Минимальный буфер — снижает задержку и потребление памяти
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Минимальный буфер
 
-            # Проверка фактических значений
+            # Проверка реальных параметров
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fps = cap.get(cv2.CAP_PROP_FPS)
-            logger.success(f"Camera {idx} initialized: {w}x{h} @ {fps:.1f} FPS")
+            logger.success(f"Camera {idx} initialized: {w}x{h} @ {fps:.1f} FPS (MJPG)")
+
+            # 🔑 Пауза между камерами — критично для USB-стабильности
+            time.sleep(0.2)
         else:
             logger.error(f"Failed to initialize camera {idx}")
         caps.append(cap)
@@ -51,7 +56,7 @@ def create_video_grid(frames, grid_size=(2, 2), output_size=(640, 480)):
     
     resized_frames = []
     for frame in frames:
-        # Пропорциональное изменение размера с обрезкой или отступами, чтобы избежать искажений
+        # Пропорциональное изменение размера с обрезкой или отступами
         h, w = frame.shape[:2]
         scale = min(cell_w / w, cell_h / h)
         new_w, new_h = int(w * scale), int(h * scale)
@@ -107,7 +112,6 @@ def get_waiting_frame(camera_idx, time_left=None, size=TARGET_RESOLUTION):
 
 class MultiMaskCreator:
     def create_mask(self, camera_index, mask_name="default"):
-        # Проверка: запущено ли в GUI-сессии (иначе cv2.imshow не работает)
         if os.environ.get('SSH_CLIENT') or os.environ.get('SSH_TTY'):
             logger.error("Mask creation requires GUI (X11/VNC). Not available over SSH.")
             return None
@@ -197,7 +201,6 @@ def load_mask(mask_path):
     if os.path.exists(mask_path):
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if mask is not None:
-            # Приводим маску к бинарному виду (0 / 255)
             _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
         return mask
     return None
@@ -207,9 +210,7 @@ def overlay_mask(frame, mask, color=(0, 255, 0), alpha=0.3):
     """Наложение маски (только если она есть)"""
     if mask is None or mask.size == 0:
         return frame
-    # Создаём цветной слой маски
     color_layer = np.full(frame.shape, color, dtype=np.uint8)
-    # Применяем прозрачность только там, где маска активна
     mask_bool = mask.astype(bool)
     frame[mask_bool] = cv2.addWeighted(frame[mask_bool], 1 - alpha, color_layer[mask_bool], alpha, 0)
     return frame
@@ -252,7 +253,6 @@ def detect_faces_only(frame, detection_scale=FACE_DETECTION_SCALE):
 
     face_boxes = []
     for (x, y, fw, fh) in faces:
-        # Масштабируем обратно
         x, y = int(x * detection_scale), int(y * detection_scale)
         fw, fh = int(fw * detection_scale), int(fh * detection_scale)
         face_boxes.append([x, y, x + fw, y + fh])
