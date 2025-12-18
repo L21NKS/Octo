@@ -285,6 +285,61 @@ def train_model():
         logger.error(f"Ошибка обучения: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/settings/apply', methods=['POST'])
+@admin_required
+def apply_settings():
+    """Применить настройки камеры к работающей системе"""
+    data = request.json
+    camera_id = data.get('camera_id')
+    
+    if camera_id is None:
+        return jsonify({'error': 'Camera ID required'}), 400
+    
+    if camera_id not in system_state['camera_settings']:
+        return jsonify({'error': f'Камера {camera_id} не найдена'}), 404
+    
+    try:
+        settings = system_state['camera_settings'][camera_id]
+        
+        # Если система запущена - применяем настройки к ней
+        if system_state['running'] and system_state['system']:
+            system = system_state['system']
+            
+            # Обновляем списки камер с включенными функциями
+            if settings['faces']:
+                if camera_id not in system.camera_faces:
+                    system.camera_faces.append(camera_id)
+            else:
+                if camera_id in system.camera_faces:
+                    system.camera_faces.remove(camera_id)
+            
+            if settings['motion']:
+                if camera_id not in system.camera_motion:
+                    system.camera_motion.append(camera_id)
+            else:
+                if camera_id in system.camera_motion:
+                    system.camera_motion.remove(camera_id)
+            
+            if settings['triggered']:
+                if camera_id not in system.camera_triggered:
+                    system.camera_triggered.append(camera_id)
+            else:
+                if camera_id in system.camera_triggered:
+                    system.camera_triggered.remove(camera_id)
+            
+            # Обновляем timeout и чувствительность
+            system.MOTION_TIMEOUTS[camera_id] = system_state['timeouts'][camera_id]
+            system.MOTION_THRESHOLDS[camera_id] = system_state['motion_sensitivity'][camera_id]
+            
+            logger.info(f"Настройки камеры {camera_id} применены к работающей системе")
+        
+        motion_logger.log_settings({f'camera_{camera_id}_settings': settings})
+        return jsonify({'success': True, 'message': f'Настройки камеры {camera_id} применены'})
+    
+    except Exception as e:
+        logger.error(f"Ошибка применения настроек камеры {camera_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/biometric/upload', methods=['POST'])
 @admin_required
 def upload_photos():
