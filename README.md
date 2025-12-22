@@ -28,7 +28,7 @@
 ### Raspberry Pi 5
 
 <p align="center">
-  <img src="https://assets.raspberrypi.com/static/raspberry-pi-5-desktop-d58a57eb4e6e7fa959ab.webp" alt="Raspberry Pi 5" width="500">
+  <img src="[https://assets.raspberrypi.com/static/raspberry-pi-5-desktop-d58a57eb4e6e7fa959ab.webp](https://avatars.mds.yandex.net/get-mpic/4484220/img_id559516706968430838.png/orig)" alt="Raspberry Pi 5" width="500">
 </p>
 
 **Raspberry Pi 5** — одноплатный компьютер пятого поколения, используемый в качестве основного вычислительного модуля системы видеонаблюдения.
