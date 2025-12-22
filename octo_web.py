@@ -27,6 +27,14 @@ from loguru import logger
 from AI_face import learning
 from config import CAMERA_INDICES, SYSTEM
 
+# === PARAMIKO ДЛЯ SSH/SFTP ===
+try:
+    import paramiko
+    PARAMIKO_AVAILABLE = True
+except ImportError:
+    PARAMIKO_AVAILABLE = False
+    logger.warning("paramiko не установлен. Функция архива недоступна. Установите: pip install paramiko")
+
 # === КОНСТАНТЫ ОПТИМИЗАЦИИ ===
 POST_MOTION_DURATION = 5  # секунд записи после движения
 PRE_RECORD_SECONDS = 4    # секунды презаписи
@@ -384,6 +392,258 @@ def upload_photos():
             file.save(filepath)
             saved_count += 1
     return jsonify({'success': True, 'message': f'Загружено {saved_count} фото'})
+
+# === АРХИВ: НАСТРОЙКИ ПОДКЛЮЧЕНИЯ ===
+archive_settings = {
+    'remote_user': 'pi',
+    'remote_password': '',
+    'remote_host': '',
+    'remote_path': '/home/pi/recordings'
+}
+
+@app.route('/api/archive/settings', methods=['GET', 'POST'])
+@admin_required
+def archive_connection_settings():
+    global archive_settings
+    if request.method == 'GET':
+        # Не отправляем пароль клиенту, только маску
+        safe_settings = archive_settings.copy()
+        safe_settings['remote_password'] = '••••••••' if archive_settings['remote_password'] else ''
+        return jsonify(safe_settings)
+    
+    data = request.json
+    if data.get('remote_user'):
+        archive_settings['remote_user'] = data['remote_user']
+    if 'remote_password' in data:
+        archive_settings['remote_password'] = data['remote_password']
+    if data.get('remote_host'):
+        archive_settings['remote_host'] = data['remote_host']
+    if data.get('remote_path'):
+        archive_settings['remote_path'] = data['remote_path']
+    
+    logger.info(f"Настройки архива обновлены (пароль скрыт)")
+    return jsonify({'success': True})
+
+@app.route('/api/archive/search', methods=['POST'])
+@admin_required
+def search_archive():
+    """Поиск файлов на удалённом сервере по дате и времени"""
+    if not PARAMIKO_AVAILABLE:
+        return jsonify({'error': 'Библиотека paramiko не установлена. Выполните: pip install paramiko'}), 500
+    
+    data = request.json
+    date = data.get('date')  # формат: YYYY-MM-DD
+    time_from = data.get('time_from', '00:00')
+    time_to = data.get('time_to', '23:59')
+    
+    if not date:
+        return jsonify({'error': 'Дата обязательна'}), 400
+    
+    if not archive_settings['remote_host']:
+        return jsonify({'error': 'Настройте адрес сервера в настройках подключения'}), 400
+    
+    if not archive_settings['remote_password']:
+        return jsonify({'error': 'Укажите пароль SSH в настройках подключения'}), 400
+    
+    try:
+        remote_user = archive_settings['remote_user']
+        remote_host = archive_settings['remote_host']
+        remote_path = archive_settings['remote_path']
+        remote_password = archive_settings['remote_password']
+        
+        # Подключаемся через paramiko
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(remote_host, username=remote_user, password=remote_password, timeout=10)
+        
+        # Ищем в директории с датой
+        date_dir = f"{remote_path}/{date}"
+        find_cmd = f"find '{date_dir}' -type f \\( -name '*.avi' -o -name '*.mp4' -o -name '*.mkv' \\) 2>/dev/null | sort"
+        
+        logger.info(f"Выполняем поиск на {remote_host}:{date_dir}")
+        
+        stdin, stdout, stderr = ssh.exec_command(find_cmd, timeout=30)
+        result_stdout = stdout.read().decode('utf-8')
+        result_stderr = stderr.read().decode('utf-8')
+        
+        if not result_stdout.strip():
+            # Попробуем искать по всей директории с фильтром по дате
+            find_cmd_alt = f"find '{remote_path}' -type f \\( -name '*.avi' -o -name '*.mp4' -o -name '*.mkv' \\) -newermt '{date}' ! -newermt '{date} 23:59:59' 2>/dev/null | sort"
+            stdin, stdout, stderr = ssh.exec_command(find_cmd_alt, timeout=30)
+            result_stdout = stdout.read().decode('utf-8')
+        
+        ssh.close()
+        
+        files = []
+        if result_stdout:
+            for line in result_stdout.strip().split('\n'):
+                if line:
+                    filename = os.path.basename(line)
+                    # Извлекаем время из имени файла (формат: recording_HH-MM-SS.avi)
+                    file_time = None
+                    if 'recording_' in filename:
+                        try:
+                            time_part = filename.split('recording_')[1].split('.')[0]
+                            file_time = time_part.replace('-', ':')
+                        except:
+                            pass
+                    
+                    # Фильтруем по времени если указано
+                    include_file = True
+                    if file_time and time_from and time_to:
+                        include_file = time_from <= file_time <= time_to
+                    
+                    if include_file:
+                        files.append({
+                            'path': line,
+                            'filename': filename,
+                            'time': file_time or 'N/A'
+                        })
+        
+        return jsonify({
+            'success': True,
+            'files': files,
+            'count': len(files),
+            'date': date
+        })
+        
+    except paramiko.AuthenticationException:
+        return jsonify({'error': 'Неверный логин или пароль SSH'}), 401
+    except paramiko.SSHException as e:
+        return jsonify({'error': f'Ошибка SSH: {str(e)}'}), 500
+    except TimeoutError:
+        return jsonify({'error': 'Превышено время ожидания подключения'}), 500
+    except Exception as e:
+        logger.error(f"Ошибка поиска в архиве: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/archive/download', methods=['POST'])
+@admin_required
+def download_archive():
+    """Подготовить файлы для скачивания через браузер"""
+    if not PARAMIKO_AVAILABLE:
+        return jsonify({'error': 'Библиотека paramiko не установлена. Выполните: pip install paramiko'}), 500
+    
+    import zipfile
+    import tempfile
+    
+    data = request.json
+    files = data.get('files', [])
+    
+    if not files:
+        return jsonify({'error': 'Не выбраны файлы для скачивания'}), 400
+    
+    if not archive_settings['remote_host']:
+        return jsonify({'error': 'Настройте адрес сервера'}), 400
+    
+    if not archive_settings['remote_password']:
+        return jsonify({'error': 'Укажите пароль SSH'}), 400
+    
+    try:
+        remote_user = archive_settings['remote_user']
+        remote_host = archive_settings['remote_host']
+        remote_password = archive_settings['remote_password']
+        
+        # Создаём временную папку для файлов
+        temp_dir = os.path.join(tempfile.gettempdir(), 'octo_downloads')
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        logger.info(f"Временная папка: {temp_dir}")
+        logger.info(f"Файлов для скачивания: {len(files)}")
+        
+        # Подключаемся через paramiko
+        logger.info(f"Подключаемся к {remote_user}@{remote_host}...")
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(remote_host, username=remote_user, password=remote_password, timeout=10)
+        sftp = ssh.open_sftp()
+        logger.info("SFTP подключение установлено")
+        
+        downloaded_files = []
+        errors = []
+        
+        for file_info in files:
+            remote_file = file_info.get('path')
+            filename = file_info.get('filename')
+            
+            logger.info(f"Обрабатываем: remote={remote_file}, filename={filename}")
+            
+            if not remote_file:
+                logger.warning("Пустой путь к файлу, пропускаем")
+                continue
+            
+            local_file = os.path.join(temp_dir, filename)
+            
+            logger.info(f"Скачиваем: {remote_file} -> {local_file}")
+            
+            try:
+                sftp.get(remote_file, local_file)
+                downloaded_files.append({'filename': filename, 'path': local_file})
+                logger.info(f"Успешно скачан: {filename}")
+            except Exception as e:
+                logger.error(f"Ошибка скачивания {filename}: {e}")
+                errors.append({'file': filename, 'error': str(e)})
+        
+        sftp.close()
+        ssh.close()
+        
+        if not downloaded_files:
+            return jsonify({'error': 'Не удалось скачать ни одного файла', 'errors': errors}), 500
+        
+        # Если один файл - возвращаем ссылку на него напрямую
+        # Если несколько - создаём ZIP архив
+        if len(downloaded_files) == 1:
+            download_id = downloaded_files[0]['filename']
+        else:
+            # Создаём ZIP архив
+            zip_filename = f"octo_archive_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            zip_path = os.path.join(temp_dir, zip_filename)
+            
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for f in downloaded_files:
+                    zipf.write(f['path'], f['filename'])
+            
+            download_id = zip_filename
+            logger.info(f"Создан архив: {zip_path}")
+        
+        return jsonify({
+            'success': True,
+            'download_url': f'/api/archive/file/{download_id}',
+            'filename': download_id,
+            'count': len(downloaded_files),
+            'errors': errors
+        })
+        
+    except paramiko.AuthenticationException:
+        return jsonify({'error': 'Неверный логин или пароль SSH'}), 401
+    except paramiko.SSHException as e:
+        return jsonify({'error': f'Ошибка SSH: {str(e)}'}), 500
+    except TimeoutError:
+        return jsonify({'error': 'Превышено время скачивания'}), 500
+    except Exception as e:
+        logger.error(f"Ошибка скачивания: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/archive/file/<filename>')
+@login_required
+def download_archive_file(filename):
+    """Отдать скачанный файл клиенту"""
+    import tempfile
+    from flask import send_file
+    
+    temp_dir = os.path.join(tempfile.gettempdir(), 'octo_downloads')
+    file_path = os.path.join(temp_dir, filename)
+    
+    if not os.path.exists(file_path):
+        return jsonify({'error': 'Файл не найден'}), 404
+    
+    logger.info(f"Отдаём файл клиенту: {file_path}")
+    
+    return send_file(
+        file_path,
+        as_attachment=True,
+        download_name=filename
+    )
 
 # === ВИДЕОПОТОК ===
 @app.route('/video_feed/<int:camera_id>')
