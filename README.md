@@ -61,7 +61,8 @@
 ### Logitech C270 HD Webcam
 
 <p align="center">
-  <img src="https://resource.logitech.com/w_800,c_lpad,ar_16:9,q_auto,f_auto,dpr_1.0/d_transparent.gif/content/dam/logitech/en/products/webcams/c270/gallery/c270-gallery-1-new.png" alt="Logitech C270" width="400">
+  <img width="1200" height="456" alt="image" src="https://github.com/user-attachments/assets/6aa8f1bd-7a40-439c-b6d0-21c973e3a1d2" />
+>
 </p>
 
 **Logitech C270** — компактная HD веб-камера, используемая для видеозахвата в системе видеонаблюдения.
